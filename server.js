@@ -1,4 +1,4 @@
-// server.js - API dự đoán Tài Xỉu với phân tích MD5 + cầu (fix lỗi parse)
+// server.js - API dự đoán Tài Xỉu với phân tích MD5 + cầu + tự động bẻ chốt
 const express = require('express');
 const axios = require('axios');
 const fs = require('fs');
@@ -50,13 +50,12 @@ function generateMockSessions() {
     return mock;
 }
 
-// ========== PARSE DỮ LIỆU TỪ API GỐC (linh hoạt, có log) ==========
+// ========== PARSE DỮ LIỆU TỪ API GỐC (linh hoạt, có log, fix dice) ==========
 function tryParseSessions(rawData) {
     let list = [];
     console.log('Raw data type:', typeof rawData);
     if (typeof rawData === 'string') {
         console.log('Raw string preview:', rawData.slice(0, 500));
-        // Tìm mảng JSON trong chuỗi
         const arrayMatch = rawData.match(/\[\s*\{[\s\S]*?\}\s*\]/);
         if (arrayMatch) {
             try { list = JSON.parse(arrayMatch[0]); console.log('Found JSON array, length:', list.length); } catch(e) {}
@@ -95,17 +94,50 @@ function tryParseSessions(rawData) {
             else if (result.includes('XIU')) result = 'XIU';
             else continue;
             
-            // Parse dice: thử nhiều dạng
+            // ========== FIX DICE: THU THẬP TỪ NHIỀU NGUỒN, TÍNH TOÁN TỔNG NẾU CẦN ==========
             let dice = [];
+            let diceSum = 0;
+            
+            // 1. Các trường mảng trực tiếp
             if (obj.dice && Array.isArray(obj.dice)) dice = obj.dice.slice(0,3);
             else if (obj.xucXac && Array.isArray(obj.xucXac)) dice = obj.xucXac.slice(0,3);
-            else if (obj.dice1 && obj.dice2 && obj.dice3) dice = [obj.dice1, obj.dice2, obj.dice3];
             else if (obj.dice_result && Array.isArray(obj.dice_result)) dice = obj.dice_result.slice(0,3);
             else if (obj.dice_value && Array.isArray(obj.dice_value)) dice = obj.dice_value.slice(0,3);
             else if (obj.values && Array.isArray(obj.values)) dice = obj.values.slice(0,3);
+            
+            // 2. Dạng dice1, dice2, dice3 riêng lẻ
+            if (dice.length !== 3 && obj.dice1 && obj.dice2 && obj.dice3) {
+                dice = [obj.dice1, obj.dice2, obj.dice3];
+            }
+            
+            // 3. Dạng "dice": "3-4-5" hoặc "3,4,5"
+            if (dice.length !== 3 && obj.dice && typeof obj.dice === 'string') {
+                const parts = obj.dice.split(/[-_,]/).map(Number);
+                if (parts.length === 3) dice = parts;
+            }
+            
+            // 4. Nếu có tổng (sum) nhưng chưa có dice -> thử phân bố đều (ước lượng)
+            if (dice.length !== 3 && (obj.sum || obj.total || obj.diceSum)) {
+                const sum = parseInt(obj.sum || obj.total || obj.diceSum);
+                if (!isNaN(sum) && sum >= 3 && sum <= 18) {
+                    // Không có dice thật, dùng tổng để sinh bộ giả định (chỉ để hiển thị)
+                    const a = Math.min(6, Math.max(1, Math.floor(sum/3)));
+                    const b = Math.min(6, Math.max(1, a + (sum % 3) - 1));
+                    const c = sum - a - b;
+                    if (c >= 1 && c <= 6) dice = [a, b, c];
+                }
+            }
+            
+            // Chuẩn hóa dice
             if (dice.length !== 3) dice = [0,0,0];
             else dice = dice.map(d => parseInt(d));
-            const diceSum = dice.reduce((a,b)=>a+b,0);
+            diceSum = dice.reduce((a,b)=>a+b,0);
+            
+            // Nếu diceSum vẫn 0 nhưng tổng có trong obj -> cập nhật lại
+            if (diceSum === 0 && (obj.sum || obj.total || obj.diceSum)) {
+                diceSum = parseInt(obj.sum || obj.total || obj.diceSum);
+            }
+            
             const md5 = (obj.md5 || obj.hash || '').replace(/\s/g, '');
             parsed.push({ id: String(id), id_num: idNum, result, dice, diceSum, md5 });
         } catch(e) { console.log('Item parse error:', e.message); }
@@ -141,6 +173,43 @@ const WEIGHT_WINDOW   = 50;   // Số phiên gần nhất để tính accuracy
 const WEIGHT_MIN      = 0.2;  // Trọng số tối thiểu (không loại hoàn toàn)
 const WEIGHT_MAX      = 3.0;  // Trọng số tối đa
 
+// ========== CƠ CHẾ TỰ ĐỘNG BẺ CHỐT ==========
+let recentPredictionAccuracy = []; // lưu { correct: bool }
+const BREAK_THRESHOLD = 0.3;      // Nếu tỉ lệ đúng dưới 30% trong 5 phiên gần nhất -> bẻ chốt
+const BREAK_WINDOW = 5;
+let breakerActive = false;
+
+// Ghi nhận kết quả dự đoán để xem xét bẻ chốt
+function recordFinalPredictionOutcome(correct) {
+    recentPredictionAccuracy.unshift({ correct });
+    if (recentPredictionAccuracy.length > BREAK_WINDOW) recentPredictionAccuracy.pop();
+    
+    if (recentPredictionAccuracy.length >= BREAK_WINDOW) {
+        const correctCount = recentPredictionAccuracy.filter(r => r.correct === true).length;
+        const accuracy = correctCount / BREAK_WINDOW;
+        // Nếu độ chính xác quá thấp -> kích hoạt bẻ chốt
+        if (accuracy < BREAK_THRESHOLD && !breakerActive) {
+            breakerActive = true;
+            console.log(`⚠️ PHÁT HIỆN GÃY CHỐT (${(accuracy*100).toFixed(0)}% đúng trong ${BREAK_WINDOW} phiên) -> KÍCH HOẠT BẺ CHỐT`);
+        } 
+        // Nếu đã bẻ chốt mà độ chính xác hồi phục > 50% thì tắt bẻ chốt
+        else if (breakerActive && accuracy >= 0.5) {
+            breakerActive = false;
+            console.log(`✅ HẾT GÃY CHỐT (${(accuracy*100).toFixed(0)}% đúng) -> TẮT BẺ CHỐT`);
+        }
+    }
+}
+
+// Hàm áp dụng bẻ chốt vào kết quả dự đoán
+function applyBreaker(prediction, confidence) {
+    if (!breakerActive) return { prediction, confidence };
+    // Đảo ngược kết quả, giảm độ tin cậy một chút (vì đang gãy)
+    const newPred = prediction === 'TAI' ? 'XIU' : 'TAI';
+    const newConf = Math.max(50, Math.min(confidence * 0.85, 70));
+    console.log(`🔀 BẺ CHỐT: ${prediction} (${confidence}%) -> ${newPred} (${newConf.toFixed(0)}%)`);
+    return { prediction: newPred, confidence: newConf };
+}
+
 // ─────────────────────────────────────────────
 // A1: STREAK — theo cầu (bệt liên tiếp)
 // Logic: Khi chuỗi liên tiếp đang chạy, xu hướng tiếp tục
@@ -155,15 +224,11 @@ function algoStreak(history) {
         else break;
     }
     if (streak < 2) return { pred: null, conf: 0 };
-    // Cầu 2: conf 55, cầu 3: 62, cầu 4: 68, cầu 5+: 72 (không leo vô hạn)
     const conf = Math.min(52 + streak * 5, 72);
     return { pred: last, conf, detail: `bệt ${streak}` };
 }
 
-// ─────────────────────────────────────────────
 // A2: BREAK STREAK — bẻ cầu dài bất thường
-// Logic: Cầu rất dài (≥6) thường có xu hướng đảo chiều
-// ─────────────────────────────────────────────
 function algoBreakStreak(history) {
     if (history.length < 6) return { pred: null, conf: 0 };
     const results = history.map(s => s.result);
@@ -174,10 +239,8 @@ function algoBreakStreak(history) {
         else break;
     }
     if (streak < 6) return { pred: null, conf: 0 };
-    // Học từ lịch sử: sau cầu dài thường bẻ không?
     let breakCount = 0, continueCount = 0;
     for (let i = 5; i < Math.min(history.length - 1, 200); i++) {
-        // Tìm vị trí có cầu dài ≥6 trong lịch sử
         const r = history[i].result;
         let s2 = 1;
         for (let j = i + 1; j < history.length; j++) {
@@ -201,10 +264,7 @@ function algoBreakStreak(history) {
     return { pred: null, conf: 0 };
 }
 
-// ─────────────────────────────────────────────
-// A3: PINGPONG — cầu đảo (T-X-T-X...)
-// Logic: Khi cầu liên tục đảo, dự đoán tiếp tục đảo
-// ─────────────────────────────────────────────
+// A3: PINGPONG — cầu đảo
 function algoPingpong(history) {
     if (history.length < 4) return { pred: null, conf: 0 };
     const results = history.map(s => s.result);
@@ -219,10 +279,7 @@ function algoPingpong(history) {
     return { pred: opposite, conf, detail: `pingpong ${ppLen}` };
 }
 
-// ─────────────────────────────────────────────
-// A4: BALANCE — cân bằng cục bộ (30 phiên)
-// Logic: Ngắn hạn, Tài/Xỉu có xu hướng tự cân bằng nhau
-// ─────────────────────────────────────────────
+// A4: BALANCE
 function algoBalance(history) {
     const window = Math.min(history.length, 30);
     if (window < 10) return { pred: null, conf: 0 };
@@ -231,16 +288,13 @@ function algoBalance(history) {
     const xiuCount = window - taiCount;
     const diff = Math.abs(taiCount - xiuCount);
     const diffRate = diff / window;
-    if (diffRate < 0.15) return { pred: null, conf: 0 }; // Quá cân bằng
-    const pred = taiCount < xiuCount ? 'TAI' : 'XIU'; // Bên ít hơn được ưu tiên
+    if (diffRate < 0.15) return { pred: null, conf: 0 };
+    const pred = taiCount < xiuCount ? 'TAI' : 'XIU';
     const conf = Math.round(50 + diffRate * 80);
     return { pred, conf: Math.min(conf, 70), detail: `T${taiCount}/X${xiuCount}/${window}` };
 }
 
-// ─────────────────────────────────────────────
-// A5: MD5 PREFIX — so khớp tiền tố MD5
-// Logic: Cùng tiền tố MD5 → cùng seed → kết quả tương tự
-// ─────────────────────────────────────────────
+// A5: MD5 PREFIX
 function algoMd5Prefix(currentMd5, history) {
     if (!currentMd5 || currentMd5.length < 8) return { pred: null, conf: 0 };
     const prefixLens = [4, 6, 8, 10];
@@ -257,7 +311,6 @@ function algoMd5Prefix(currentMd5, history) {
         const winSide = taiCount >= xiuCount ? 'TAI' : 'XIU';
         const winRate = Math.max(taiCount, xiuCount) / total;
         if (winRate <= 0.55) continue;
-        // Tiền tố dài hơn → đáng tin hơn
         const conf = Math.round(50 + winRate * 35 + pLen * 0.5);
         if (conf > bestConf) {
             bestPred = winSide; bestConf = conf;
@@ -267,13 +320,9 @@ function algoMd5Prefix(currentMd5, history) {
     return { pred: bestPred, conf: Math.min(bestConf, 88), detail: bestDetail };
 }
 
-// ─────────────────────────────────────────────
-// A6: MD5 SEGMENT — so khớp từng đoạn 4 ký tự
-// Logic: MD5 có cấu trúc nội tại; các đoạn giữa phản ánh entropy seed
-// ─────────────────────────────────────────────
+// A6: MD5 SEGMENT
 function algoMd5Segment(currentMd5, history) {
     if (!currentMd5 || currentMd5.length < 16) return { pred: null, conf: 0 };
-    // Lấy 4 đoạn: [0-3], [4-7], [8-11], [12-15]
     const segments = [
         currentMd5.slice(0, 4),
         currentMd5.slice(4, 8),
@@ -288,7 +337,7 @@ function algoMd5Segment(currentMd5, history) {
             if (s.md5.slice(si * 4, si * 4 + 4) === segments[si]) matchSegs++;
         }
         if (matchSegs < 2) continue;
-        const weight = matchSegs * matchSegs; // 2 segs → 4, 3 segs → 9, 4 segs → 16
+        const weight = matchSegs * matchSegs;
         if (s.result === 'TAI') scoreTai += weight;
         else scoreXiu += weight;
         totalHits++;
@@ -302,13 +351,10 @@ function algoMd5Segment(currentMd5, history) {
     return { pred, conf: Math.min(conf, 85), detail: `seg n=${totalHits}` };
 }
 
-// ─────────────────────────────────────────────
-// A7: ID PARITY — phân tích chẵn/lẻ ID
-// Logic: Một số game seed theo ID; ID chẵn/lẻ có pattern riêng
-// ─────────────────────────────────────────────
+// A7: ID PARITY
 function algoIdParity(nextIdNum, history) {
     if (history.length < 20) return { pred: null, conf: 0 };
-    const parity = nextIdNum % 2; // 0 = chẵn, 1 = lẻ
+    const parity = nextIdNum % 2;
     const sameParityHistory = history.filter(s => s.id_num % 2 === parity).slice(0, 100);
     if (sameParityHistory.length < 10) return { pred: null, conf: 0 };
     const taiCount = sameParityHistory.filter(s => s.result === 'TAI').length;
@@ -321,15 +367,10 @@ function algoIdParity(nextIdNum, history) {
     return { pred, conf: Math.min(conf, 72), detail: `id_parity=${parity === 0 ? 'chẵn' : 'lẻ'} n=${total}` };
 }
 
-// ─────────────────────────────────────────────
-// A8: MARKOV bậc 2/3 — xác suất chuyển trạng thái
-// Logic: P(kết quả | 2-3 phiên trước) từ lịch sử thực tế
-// ─────────────────────────────────────────────
+// A8: MARKOV
 function algoMarkov(history) {
     if (history.length < 30) return { pred: null, conf: 0 };
     const results = history.map(s => s.result);
-
-    // Bậc 3: state = "T-X-T" → đếm kết quả tiếp theo
     const stateMap3 = {};
     for (let i = 3; i < results.length; i++) {
         const state = `${results[i]}|${results[i-1]}|${results[i-2]}`;
@@ -349,8 +390,6 @@ function algoMarkov(history) {
             }
         }
     }
-
-    // Bậc 2: fallback
     const stateMap2 = {};
     for (let i = 2; i < results.length; i++) {
         const state = `${results[i]}|${results[i-1]}`;
@@ -373,9 +412,7 @@ function algoMarkov(history) {
     return { pred: null, conf: 0 };
 }
 
-// ─────────────────────────────────────────────
-// WEIGHT ENGINE — tự học trọng số từ kết quả thực tế
-// ─────────────────────────────────────────────
+// WEIGHT ENGINE
 function recordAlgoResult(algoName, prediction, actual) {
     if (!prediction) return;
     const correct = prediction === actual ? 1 : 0;
@@ -390,17 +427,14 @@ function recalcWeights() {
         const hist = algoHistory[name];
         if (hist.length < 5) { algoWeights[name] = 1.0; continue; }
         const accuracy = hist.reduce((a, b) => a + b, 0) / hist.length;
-        // Ánh xạ: 50% accuracy → trọng số 0.2; 80%+ → trọng số 3.0
-        const raw = (accuracy - 0.5) / 0.3; // -inf..1
+        const raw = (accuracy - 0.5) / 0.3;
         algoWeights[name] = Math.max(WEIGHT_MIN, Math.min(WEIGHT_MAX,
             WEIGHT_MIN + (WEIGHT_MAX - WEIGHT_MIN) * Math.max(0, raw)
         ));
     }
 }
 
-// ─────────────────────────────────────────────
-// OMEGA FUSION — gộp 8 thuật toán thành 1 phán quyết
-// ─────────────────────────────────────────────
+// OMEGA FUSION
 function omegaPredict(history, nextIdNum) {
     if (history.length < 2) {
         return { prediction: 'TAI', confidence: 50, method: 'Chưa đủ dữ liệu', breakdown: {} };
@@ -409,7 +443,6 @@ function omegaPredict(history, nextIdNum) {
     const latest = history[0];
     const histExcludingLatest = history.slice(1);
 
-    // Chạy 8 thuật toán
     const algos = {
         streak:      algoStreak(history),
         breakStreak: algoBreakStreak(history),
@@ -421,7 +454,6 @@ function omegaPredict(history, nextIdNum) {
         markov:      algoMarkov(history),
     };
 
-    // Weighted voting
     let scoreTai = 0, scoreXiu = 0;
     const activeAlgos = [];
     const algoNames = {
@@ -443,7 +475,6 @@ function omegaPredict(history, nextIdNum) {
     let finalPred, finalConf, method;
 
     if (totalScore === 0) {
-        // Fallback tuyệt đối: thống kê 50 phiên gần nhất
         const n = Math.min(history.length, 50);
         const taiN = history.slice(0, n).filter(s => s.result === 'TAI').length;
         finalPred = taiN >= n / 2 ? 'TAI' : 'XIU';
@@ -452,7 +483,6 @@ function omegaPredict(history, nextIdNum) {
     } else {
         const winScore = Math.max(scoreTai, scoreXiu);
         finalPred = scoreTai >= scoreXiu ? 'TAI' : 'XIU';
-        // Confidence = tỷ lệ phiếu thắng, scale 50-94
         const winRate = winScore / totalScore;
         finalConf = Math.round(50 + (winRate - 0.5) * 88);
         finalConf = Math.max(50, Math.min(finalConf, 94));
@@ -468,7 +498,6 @@ function omegaPredict(history, nextIdNum) {
         }
     }
 
-    // Ghi nhận dự đoán từng algo để học sau
     const breakdown = {};
     for (const [name, result] of Object.entries(algos)) {
         breakdown[name] = { pred: result.pred, conf: result.conf,
@@ -479,16 +508,13 @@ function omegaPredict(history, nextIdNum) {
         breakdown, activeCount: activeAlgos.length, activeAlgos };
 }
 
-// ─────────────────────────────────────────────
-// UPDATE — cập nhật dự đoán + học lại trọng số
-// ─────────────────────────────────────────────
+// UPDATE predictions + học + bẻ chốt
 function updatePredictions() {
     if (sessions.length === 0) return;
     const latest    = sessions[0];
     const nextIdNum = latest.id_num + 1;
 
-    // Học trọng số: với mỗi phiên vừa có kết quả thực tế,
-    // truy tìm dự đoán từng algo tại thời điểm đó và ghi nhận đúng/sai
+    // Học trọng số từ các phiên đã có kết quả
     for (const sess of sessions.slice(0, 20)) {
         const pred = predictions.find(p => p.predictedId === sess.id_num && p.correct !== null);
         if (!pred || !pred.algoBreakdown) continue;
@@ -500,37 +526,44 @@ function updatePredictions() {
     }
     recalcWeights();
 
-    // Dự đoán phiên tiếp theo
-    const result = omegaPredict(sessions, nextIdNum);
+    // Dự đoán từ Omega
+    let { prediction, confidence, method, breakdown, activeCount, activeAlgos } = omegaPredict(sessions, nextIdNum);
+    
+    // Áp dụng cơ chế bẻ chốt nếu đang gãy
+    const finalResult = applyBreaker(prediction, confidence);
+    prediction = finalResult.prediction;
+    confidence = finalResult.confidence;
+    if (breakerActive) method = `[BẺ CHỐT] ${method}`;
 
     const existing = predictions.find(p => p.predictedId === nextIdNum);
     if (!existing) {
         predictions.unshift({
             predictedId:   nextIdNum,
-            predicted:     result.prediction,
-            confidence:    result.confidence,
-            method:        result.method,
-            algoBreakdown: result.breakdown,
-            activeAlgos:   result.activeAlgos,
+            predicted:     prediction,
+            confidence:    confidence,
+            method:        method,
+            algoBreakdown: breakdown,
+            activeAlgos:   activeAlgos,
             actual:        null,
             correct:       null,
             timestamp:     Date.now(),
         });
     } else if (existing.correct === null) {
-        existing.predicted     = result.prediction;
-        existing.confidence    = result.confidence;
-        existing.method        = result.method;
-        existing.algoBreakdown = result.breakdown;
-        existing.activeAlgos   = result.activeAlgos;
+        existing.predicted     = prediction;
+        existing.confidence    = confidence;
+        existing.method        = method;
+        existing.algoBreakdown = breakdown;
+        existing.activeAlgos   = activeAlgos;
     }
 
     if (predictions.length > MAX_HISTORY) predictions = predictions.slice(0, MAX_HISTORY);
     saveCache();
 
-    const icon = result.prediction === 'TAI' ? '🔴' : '⚪';
-    console.log(`[OMEGA] Phiên #${nextIdNum}: ${icon} ${result.prediction} ${result.confidence}% | ${result.method} | ${result.activeCount}/8 thuật toán`);
+    const icon = prediction === 'TAI' ? '🔴' : '⚪';
+    console.log(`[OMEGA] Phiên #${nextIdNum}: ${icon} ${prediction} ${confidence}% | ${method} | ${activeCount}/8 thuật toán`);
     const wStr = Object.entries(algoWeights).map(([k, v]) => `${k}:${v.toFixed(2)}`).join(' ');
     console.log(`[WEIGHT] ${wStr}`);
+    if (breakerActive) console.log(`⚠️ ĐANG TRONG CHẾ ĐỘ BẺ CHỐT (đúng ${recentPredictionAccuracy.filter(r=>r.correct).length}/${BREAK_WINDOW} phiên gần nhất)`);
 }
 
 // ========== FETCH DỮ LIỆU THẬT ==========
@@ -557,13 +590,16 @@ async function fetchRealData() {
         sessions.sort((a,b) => b.id_num - a.id_num);
         if (sessions.length > MAX_HISTORY) sessions = sessions.slice(0, MAX_HISTORY);
         console.log(`Added ${added} new sessions. Total: ${sessions.length}`);
-        // Cập nhật kết quả cho dự đoán cũ
+        
+        // Cập nhật kết quả cho dự đoán cũ và ghi nhận độ chính xác để bẻ chốt
         for (const sess of parsedSessions) {
             const pred = predictions.find(p => p.predictedId === sess.id_num);
             if (pred && pred.correct === null) {
                 pred.actual = sess.result;
                 pred.correct = (pred.predicted === sess.result);
                 console.log(`Prediction for #${sess.id_num}: ${pred.correct ? 'Đúng' : 'Sai'}`);
+                // Ghi nhận kết quả toàn cục để kích hoạt/tắt bẻ chốt
+                recordFinalPredictionOutcome(pred.correct);
             }
         }
         usingMock = false;
@@ -641,15 +677,16 @@ app.get('/predict_text', (req, res) => {
         .map(([k, v]) => `${k.replace('Segment','Seg').replace('Prefix','Pre')}:${v.toFixed(2)}`)
         .join('  ');
 
-    // ── Lịch sử phiên ──
+    // ── Lịch sử phiên (có xúc xắc) ──
     const maxDisplay = Math.min(sessions.length, 20);
     let histLines = `\n📜 ${maxDisplay} PHIÊN GẦN NHẤT\n${sep2}\n`;
-    histLines += `${pad('Phiên', 10)} ${pad('K.Quả', 8)} MD5 (8 ký tự đầu)\n${sep2}\n`;
+    histLines += `${pad('Phiên', 10)} ${pad('K.Quả', 8)} Xúc xắc    MD5 (8 ký tự)\n${sep2}\n`;
     for (let i = 0; i < maxDisplay; i++) {
         const s = sessions[i];
         const kq = s.result === 'TAI' ? '🔴 Tài  ' : '⚪ Xỉu  ';
+        const diceStr = s.dice && s.dice.length === 3 ? s.dice.join('-') : '?-?-?';
         const md5short = s.md5 ? s.md5.slice(0, 8) : '—';
-        histLines += `${pad('#' + s.id_num, 10)} ${kq} ${md5short}\n`;
+        histLines += `${pad('#' + s.id_num, 10)} ${kq} ${pad(diceStr, 10)} ${md5short}\n`;
     }
     if (sessions.length > maxDisplay) histLines += `  ... và ${sessions.length - maxDisplay} phiên cũ hơn\n`;
 
@@ -671,6 +708,7 @@ app.get('/predict_text', (req, res) => {
     statsLines += `Tổng: ${totalCmpl}  ✅ ${correctCount}  ❌ ${totalCmpl - correctCount}  🎯 ${accuracy}%\n`;
 
     const statusNote = usingMock ? `\n⚠️  MOCK DATA — chưa kết nối API thật\n` : '';
+    const breakerNote = breakerActive ? `\n🔀 CHẾ ĐỘ BẺ CHỐT ĐANG HOẠT ĐỘNG (gãy ${BREAK_WINDOW} phiên gần nhất)\n` : '';
 
     const out =
 `${SEP}
@@ -678,8 +716,9 @@ app.get('/predict_text', (req, res) => {
 ${SEP}
 📌  Phiên hiện tại : #${latest.id_num}
 🏆  Kết quả         : ${latest.result === 'TAI' ? '🔴 Tài' : '⚪ Xỉu'}
+🎲  Xúc xắc        : ${latest.dice.join('-')}  (Tổng ${latest.diceSum})
 🔑  MD5             : ${latest.md5 ? latest.md5.slice(0, 16) + '...' : '—'}
-${statusNote}${SEP}
+${statusNote}${breakerNote}${SEP}
 ✨  CHỐT PHIÊN #${nextId}
 👉  ${chot}
 📊  Tin cậy  : ${tinCayBar}
@@ -715,6 +754,7 @@ app.get('/predict', (req, res) => {
     res.json({
         status: 'success',
         using_mock: usingMock,
+        breaker_active: breakerActive,
         timestamp: new Date().toISOString(),
         phien_hien_tai: {
             id: latest.id_num,
@@ -761,7 +801,7 @@ app.post('/force_fetch', async (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok', sessions: sessions.length, predictions: predictions.length, using_mock: usingMock, last_error: lastFetchError });
+    res.json({ status: 'ok', sessions: sessions.length, predictions: predictions.length, using_mock: usingMock, breaker_active: breakerActive, last_error: lastFetchError });
 });
 
 app.listen(PORT, () => {
