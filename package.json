@@ -1,7 +1,7 @@
 {
   "name": "sxd-prediction-api",
   "version": "1.0.0",
-  "description": "API dự đoán Tài Xỉu dựa trên phân tích MD5 và cầu",
+  "description": "API dự đoán Tài Xỉu với phân tích MD5 + Cầu, xuất báo cáo theo mẫu",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
