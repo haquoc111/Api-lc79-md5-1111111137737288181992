@@ -1,6 +1,8 @@
-// server.js - API dự đoán Tài Xỉu (đã fix lỗi "Chưa có dữ liệu")
+// server.js - API dự đoán Tài Xỉu (fix lỗi không lấy được dữ liệu API gốc)
 const express = require('express');
 const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -8,130 +10,109 @@ const PORT = process.env.PORT || 3000;
 // ========== CẤU HÌNH ==========
 const API_URL = 'https://treo-lc79-h6zy.onrender.com/';
 const MAX_HISTORY = 100000;
-const FETCH_INTERVAL = 30000; // 30 giây
+const FETCH_INTERVAL = 30000;
+const CACHE_FILE = path.join(__dirname, 'sessions_cache.json');
 
-// ========== DỮ LIỆU MẪU (mock data) - dùng khi API lỗi ==========
+// ========== LƯU TRỮ ==========
+let sessions = [];      // [{ id, id_num, result, dice, diceSum, md5 }]
+let predictions = [];   // [{ predictedId, predicted, confidence, method, actual, correct, timestamp }]
+let usingMock = false;
+let lastFetchError = null;
+let isFetching = false;
+
+// ========== HÀM ĐỌC/GHI CACHE ==========
+function loadCache() {
+    try {
+        if (fs.existsSync(CACHE_FILE)) {
+            const data = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf-8'));
+            if (data.sessions && Array.isArray(data.sessions)) {
+                sessions = data.sessions;
+                console.log(`Loaded ${sessions.length} sessions from cache.`);
+            }
+            if (data.predictions && Array.isArray(data.predictions)) {
+                predictions = data.predictions;
+                console.log(`Loaded ${predictions.length} predictions from cache.`);
+            }
+        }
+    } catch (e) { console.error('Load cache error:', e.message); }
+}
+
+function saveCache() {
+    try {
+        fs.writeFileSync(CACHE_FILE, JSON.stringify({ sessions, predictions }, null, 2));
+    } catch (e) { console.error('Save cache error:', e.message); }
+}
+
+// ========== DỮ LIỆU MOCK ==========
 function generateMockSessions() {
     const mock = [];
-    const now = Date.now();
-    // Tạo 50 phiên giả lập, mới nhất trước
     for (let i = 0; i < 50; i++) {
         const idNum = 1000000 + i;
         const result = Math.random() > 0.5 ? 'TAI' : 'XIU';
         const dice = [Math.floor(Math.random()*6)+1, Math.floor(Math.random()*6)+1, Math.floor(Math.random()*6)+1];
         const diceSum = dice.reduce((a,b)=>a+b,0);
-        const md5 = `mock_${idNum}_${Math.random().toString(36).substring(2, 10)}`;
-        mock.push({
-            id: String(idNum),
-            id_num: idNum,
-            result,
-            dice,
-            diceSum,
-            md5
-        });
+        const md5 = `mock_${idNum}_${Math.random().toString(36).substring(2,10)}`;
+        mock.push({ id: String(idNum), id_num: idNum, result, dice, diceSum, md5 });
     }
-    // Sắp xếp giảm dần
     mock.sort((a,b) => b.id_num - a.id_num);
     return mock;
 }
 
-let sessions = [];      // [{ id, id_num, result, dice, diceSum, md5 }]
-let predictions = [];   // [{ predictedId, predicted, confidence, method, actual, correct, timestamp }]
-let lastFetchError = null;
-let isFetching = false;
-let usingMock = true;   // đang dùng mock hay dữ liệu thật
-
-// Khởi tạo mock ngay lập tức
-sessions = generateMockSessions();
-console.log(`[MOCK] Khởi tạo ${sessions.length} phiên giả lập.`);
-
-// ========== HÀM PARSE (cải tiến cực mạnh) ==========
-function extractListFromResponse(data) {
-    try {
-        // Nếu là string, thử parse JSON
-        if (typeof data === 'string') {
-            // Thử tìm mảng JSON trong chuỗi (kể cả có text bao quanh)
-            const jsonMatch = data.match(/\[\s*\{.*?\}\s*\]/s);
-            if (jsonMatch) {
-                try {
-                    return JSON.parse(jsonMatch[0]);
-                } catch(e) {}
-            }
-            // Thử parse toàn bộ string như JSON
-            try {
-                const parsed = JSON.parse(data);
-                if (Array.isArray(parsed)) return parsed;
-                if (parsed?.data && Array.isArray(parsed.data)) return parsed.data;
-                if (parsed?.list && Array.isArray(parsed.list)) return parsed.list;
-                if (parsed?.result && Array.isArray(parsed.result)) return parsed.result;
-            } catch(e) {}
-            // Thử tìm object chứa mảng
-            const arrayMatch = data.match(/"data"\s*:\s*\[.*?\]/s);
-            if (arrayMatch) {
-                try {
-                    const fakeObj = JSON.parse('{' + arrayMatch[0] + '}');
-                    if (Array.isArray(fakeObj.data)) return fakeObj.data;
-                } catch(e) {}
+// ========== PARSE DỮ LIỆU THẬT (cực kỳ linh hoạt) ==========
+function tryParseSessions(rawData) {
+    let list = [];
+    // Nếu là string, thử parse JSON
+    if (typeof rawData === 'string') {
+        // Tìm mảng JSON trong chuỗi
+        const arrayMatch = rawData.match(/\[\s*\{[\s\S]*?\}\s*\]/);
+        if (arrayMatch) {
+            try { list = JSON.parse(arrayMatch[0]); } catch(e) {}
+        }
+        if (!list.length) {
+            try { list = JSON.parse(rawData); } catch(e) {}
+        }
+    } else if (Array.isArray(rawData)) {
+        list = rawData;
+    } else if (rawData && typeof rawData === 'object') {
+        // Thử tìm mảng trong các key phổ biến
+        for (const key of ['data', 'list', 'result', 'sessions', 'items', 'history']) {
+            if (Array.isArray(rawData[key])) {
+                list = rawData[key];
+                break;
             }
         }
-        if (Array.isArray(data)) return data;
-        if (data?.data && Array.isArray(data.data)) return data.data;
-        if (data?.list && Array.isArray(data.list)) return data.list;
-        if (data?.result && Array.isArray(data.result)) return data.result;
-        return [];
-    } catch (e) {
-        console.error('extractListFromResponse error:', e.message);
-        return [];
+        // Nếu không, thử chuyển object thành mảng các giá trị
+        if (!list.length && Object.values(rawData).some(v => Array.isArray(v))) {
+            const arr = Object.values(rawData).find(v => Array.isArray(v));
+            if (arr) list = arr;
+        }
     }
-}
-
-function normalizeSession(item) {
-    try {
-        let obj = typeof item === 'string' ? JSON.parse(item) : item;
-        if (!obj) return null;
-
-        let id = obj.id || obj.session_id || obj.sessionId || '';
-        let idNum = parseInt(id.toString().replace(/\D/g, ''));
-        if (isNaN(idNum)) return null;
-
-        let result = (obj.result || '').toUpperCase();
-        if (!result.includes('TAI') && !result.includes('XIU')) {
-            if (obj.taiXiu) result = obj.taiXiu === 'TAI' ? 'TAI' : 'XIU';
-            else if (obj.status) result = obj.status === 'TAI' ? 'TAI' : 'XIU';
-            else if (obj.prediction) result = obj.prediction === 'TAI' ? 'TAI' : 'XIU';
-            else return null;
-        }
-        result = result.includes('TAI') ? 'TAI' : 'XIU';
-
-        let dice = [];
-        let diceSum = 0;
-        if (obj.dice && Array.isArray(obj.dice)) dice = obj.dice.slice(0,3);
-        else if (obj.xucXac && Array.isArray(obj.xucXac)) dice = obj.xucXac.slice(0,3);
-        else if (obj.dice1 && obj.dice2 && obj.dice3) dice = [obj.dice1, obj.dice2, obj.dice3];
-        else if (obj.dice_result && Array.isArray(obj.dice_result)) dice = obj.dice_result.slice(0,3);
-        if (dice.length === 3) {
+    // Chuẩn hóa từng item
+    const sessions = [];
+    for (const item of list) {
+        try {
+            let obj = typeof item === 'string' ? JSON.parse(item) : item;
+            if (!obj) continue;
+            let id = obj.id || obj.session_id || obj.sessionId || '';
+            let idNum = parseInt(id.toString().replace(/\D/g, ''));
+            if (isNaN(idNum)) continue;
+            let result = (obj.result || obj.taiXiu || obj.status || '').toUpperCase();
+            if (result.includes('TAI')) result = 'TAI';
+            else if (result.includes('XIU')) result = 'XIU';
+            else continue;
+            let dice = [];
+            if (obj.dice && Array.isArray(obj.dice)) dice = obj.dice.slice(0,3);
+            else if (obj.xucXac && Array.isArray(obj.xucXac)) dice = obj.xucXac.slice(0,3);
+            else if (obj.dice1 && obj.dice2 && obj.dice3) dice = [obj.dice1, obj.dice2, obj.dice3];
+            else if (obj.dice_result && Array.isArray(obj.dice_result)) dice = obj.dice_result.slice(0,3);
+            if (dice.length !== 3) dice = [0,0,0];
             dice = dice.map(d => parseInt(d));
-            diceSum = dice.reduce((a,b)=>a+b,0);
-        } else {
-            // Nếu không có dice, thử tìm tổng?
-            dice = [0,0,0];
-            diceSum = 0;
-        }
-
-        let md5 = obj.md5 || obj.hash || obj.md5_hash || '';
-
-        return {
-            id: String(id),
-            id_num: idNum,
-            result,
-            dice,
-            diceSum,
-            md5: md5.replace(/\s/g, '')
-        };
-    } catch (e) {
-        console.error('normalizeSession error:', e.message);
-        return null;
+            const diceSum = dice.reduce((a,b)=>a+b,0);
+            const md5 = (obj.md5 || obj.hash || '').replace(/\s/g, '');
+            sessions.push({ id: String(id), id_num: idNum, result, dice, diceSum, md5 });
+        } catch(e) {}
     }
+    return sessions;
 }
 
 // ========== THUẬT TOÁN PHÂN TÍCH (giữ nguyên) ==========
@@ -146,9 +127,7 @@ function findSimilarMd5(currentMd5, history) {
             if (currentMd5[i] === s.md5[i]) matchCount++;
         }
         const ratio = matchCount / minLen;
-        if (ratio >= 0.7) {
-            similar.push({ session: s, ratio });
-        }
+        if (ratio >= 0.7) similar.push({ session: s, ratio });
     }
     similar.sort((a,b) => b.ratio - a.ratio);
     return similar.slice(0, 20);
@@ -255,91 +234,87 @@ function combinePredictions(md5Pred, patternPred) {
     return { prediction: finalPred, confidence: finalConf, method };
 }
 
-// ========== CẬP NHẬT DỮ LIỆU TỪ API THẬT ==========
-async function fetchAndUpdate() {
+// ========== CẬP NHẬT DỰ ĐOÁN (dùng sessions hiện tại) ==========
+function updatePredictions() {
+    if (sessions.length === 0) return;
+    const latest = sessions[0];
+    const nextIdNum = latest.id_num + 1;
+    const historyResults = sessions.slice(1);
+    const md5Analysis = analyzeMd5(latest.md5, historyResults);
+    const patternAnalysis = analyzePattern(sessions);
+    const combined = combinePredictions(md5Analysis, patternAnalysis);
+    if (combined.prediction) {
+        // Chỉ thêm nếu chưa có dự đoán cho phiên này
+        const existing = predictions.find(p => p.predictedId === nextIdNum);
+        if (!existing) {
+            predictions.unshift({
+                predictedId: nextIdNum,
+                predicted: combined.prediction,
+                confidence: combined.confidence,
+                method: combined.method,
+                actual: null,
+                correct: null,
+                timestamp: Date.now()
+            });
+        } else if (existing.correct === null) {
+            existing.predicted = combined.prediction;
+            existing.confidence = combined.confidence;
+            existing.method = combined.method;
+        }
+        if (predictions.length > MAX_HISTORY) predictions = predictions.slice(0, MAX_HISTORY);
+        saveCache();
+    }
+}
+
+// ========== FETCH DỮ LIỆU TỪ API GỐC ==========
+async function fetchRealData() {
     if (isFetching) return false;
     isFetching = true;
     try {
-        console.log(`[${new Date().toISOString()}] Fetching real data from API...`);
-        const resp = await axios.get(API_URL, {
-            timeout: 20000,
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Accept': 'application/json, text/plain, */*'
-            }
-        });
-        console.log(`Response status: ${resp.status}, content-type: ${resp.headers['content-type']}`);
+        console.log(`[${new Date().toISOString()}] Fetching from ${API_URL}...`);
+        const resp = await axios.get(API_URL, { timeout: 20000, headers: { 'User-Agent': 'Mozilla/5.0' } });
+        console.log(`Status: ${resp.status}, Content-Type: ${resp.headers['content-type']}`);
+        console.log(`Raw response preview: ${typeof resp.data === 'string' ? resp.data.slice(0, 500) : JSON.stringify(resp.data).slice(0, 500)}`);
         
-        const rawList = extractListFromResponse(resp.data);
-        if (rawList.length === 0) {
-            console.warn('Real API returned empty list. Keeping existing data.');
-            lastFetchError = 'API trả về danh sách rỗng';
+        const parsedSessions = tryParseSessions(resp.data);
+        console.log(`Parsed ${parsedSessions.length} sessions from real API.`);
+        
+        if (parsedSessions.length === 0) {
+            lastFetchError = 'API trả về nhưng không parse được phiên nào';
             isFetching = false;
             return false;
         }
         
-        const newSessions = rawList.map(normalizeSession).filter(Boolean);
-        if (newSessions.length === 0) {
-            console.warn('No valid sessions from real API. Keeping existing data.');
-            lastFetchError = 'Không có phiên hợp lệ sau khi parse';
-            isFetching = false;
-            return false;
-        }
-        
-        // Sắp xếp mới nhất lên đầu
-        newSessions.sort((a,b) => b.id_num - a.id_num);
-        
-        // Hợp nhất với sessions cũ (ưu tiên dữ liệu thật)
+        // Hợp nhất với sessions hiện tại (ưu tiên dữ liệu mới hơn theo id_num)
         const existingIds = new Set(sessions.map(s => s.id));
-        let addedCount = 0;
-        for (const ns of newSessions) {
+        let added = 0;
+        for (const ns of parsedSessions) {
             if (!existingIds.has(ns.id)) {
                 sessions.unshift(ns);
-                addedCount++;
+                added++;
                 existingIds.add(ns.id);
             }
         }
-        // Giới hạn số lượng
+        // Sắp xếp giảm dần
+        sessions.sort((a,b) => b.id_num - a.id_num);
         if (sessions.length > MAX_HISTORY) sessions = sessions.slice(0, MAX_HISTORY);
-        console.log(`Real API added ${addedCount} new sessions. Total: ${sessions.length}`);
+        console.log(`Added ${added} new sessions. Total sessions: ${sessions.length}`);
+        
+        // Cập nhật kết quả thực cho các dự đoán cũ
+        for (const sess of parsedSessions) {
+            const pred = predictions.find(p => p.predictedId === sess.id_num);
+            if (pred && pred.correct === null) {
+                pred.actual = sess.result;
+                pred.correct = (pred.predicted === sess.result);
+                console.log(`Prediction for #${sess.id_num}: ${pred.correct ? 'Đúng' : 'Sai'}`);
+            }
+        }
+        
         usingMock = false;
-        
-        // Cập nhật kết quả thực cho các dự đoán trước
-        for (const sess of newSessions) {
-            const existingPred = predictions.find(p => p.predictedId === sess.id_num);
-            if (existingPred && existingPred.correct === null) {
-                existingPred.actual = sess.result;
-                existingPred.correct = (existingPred.predicted === sess.result);
-                existingPred.timestamp = Date.now();
-                console.log(`Updated prediction for session ${sess.id_num}: ${existingPred.correct ? 'Correct' : 'Wrong'}`);
-            }
-        }
-        
-        // Dự đoán cho phiên tiếp theo
-        if (sessions.length > 0) {
-            const latest = sessions[0];
-            const nextIdNum = latest.id_num + 1;
-            const historyResults = sessions.slice(1);
-            const md5Analysis = analyzeMd5(latest.md5, historyResults);
-            const patternAnalysis = analyzePattern(sessions);
-            const combined = combinePredictions(md5Analysis, patternAnalysis);
-            
-            if (combined.prediction) {
-                predictions.unshift({
-                    predictedId: nextIdNum,
-                    predicted: combined.prediction,
-                    confidence: combined.confidence,
-                    method: combined.method,
-                    actual: null,
-                    correct: null,
-                    timestamp: Date.now()
-                });
-                if (predictions.length > MAX_HISTORY) predictions = predictions.slice(0, MAX_HISTORY);
-                console.log(`New prediction for session #${nextIdNum}: ${combined.prediction} (${combined.confidence}%)`);
-            }
-        }
-        
         lastFetchError = null;
+        // Tạo dự đoán mới dựa trên dữ liệu vừa cập nhật
+        updatePredictions();
+        saveCache();
         isFetching = false;
         return true;
     } catch (err) {
@@ -350,47 +325,43 @@ async function fetchAndUpdate() {
     }
 }
 
-// Tự động fetch mỗi 30 giây, nhưng không ghi đè nếu fetch thất bại (vẫn giữ mock hoặc dữ liệu cũ)
-setInterval(async () => {
-    await fetchAndUpdate();
-}, FETCH_INTERVAL);
-// Chạy fetch lần đầu sau 1 giây để không block khởi động
-setTimeout(() => fetchAndUpdate(), 1000);
+// ========== KHỞI TẠO SERVER ==========
+loadCache();
+if (sessions.length === 0) {
+    sessions = generateMockSessions();
+    usingMock = true;
+    console.log('Using mock data because no cache found.');
+    updatePredictions();
+    saveCache();
+}
+
+// Tự động fetch mỗi 30 giây
+setInterval(() => fetchRealData(), FETCH_INTERVAL);
+// Fetch lần đầu sau 1 giây
+setTimeout(() => fetchRealData(), 1000);
 
 // ========== API ENDPOINTS ==========
-app.use(express.json());
+app.use(express.json({ limit: '5mb' }));
 
-// Endpoint text theo mẫu yêu cầu
-app.get('/predict_text', async (req, res) => {
-    // Đảm bảo sessions luôn có dữ liệu (mock đã có sẵn)
+// Endpoint text theo mẫu
+app.get('/predict_text', (req, res) => {
     if (sessions.length === 0) {
-        // fallback cuối: tạo mock mới
-        sessions = generateMockSessions();
-        usingMock = true;
+        return res.send('Chưa có dữ liệu. Vui lòng đợi fetch hoặc dùng /fetch để gửi dữ liệu thủ công.');
     }
-    
     const latest = sessions[0];
     const nextId = latest.id_num + 1;
     const lastPrediction = predictions.find(p => p.predictedId === nextId);
     
-    // Tạo phần "Thuật toán dự đoán": liệt kê 100 phiên gần nhất
-    let thuatToan = '📜 **LỊCH SỬ CÁC PHIÊN (KẾT QUẢ THỰC TẾ)**\n';
-    thuatToan += '| Phiên | Kết quả | Xúc xắc |\n';
-    thuatToan += '|-------|---------|---------|\n';
+    let thuatToan = '📜 **LỊCH SỬ CÁC PHIÊN (KẾT QUẢ THỰC TẾ)**\n| Phiên | Kết quả | Xúc xắc |\n|-------|---------|---------|\n';
     const maxDisplay = Math.min(sessions.length, 100);
     for (let i = 0; i < maxDisplay; i++) {
         const s = sessions[i];
         const diceStr = s.dice.length ? s.dice.join('-') : '?';
         thuatToan += `| ${s.id_num} | ${s.result === 'TAI' ? 'Tài' : 'Xỉu'} | ${diceStr} |\n`;
     }
-    if (sessions.length > 100) {
-        thuatToan += `| ... và ${sessions.length - 100} phiên cũ hơn | ... | ... |\n`;
-    }
+    if (sessions.length > 100) thuatToan += `| ... và ${sessions.length - 100} phiên cũ hơn | ... | ... |\n`;
     
-    // Thống kê dự đoán
-    let thongKe = '\n📊 **THỐNG KÊ DỰ ĐOÁN**\n';
-    thongKe += '| Phiên | KQ thực | Dự đoán | Đánh giá |\n';
-    thongKe += '|-------|---------|---------|----------|\n';
+    let thongKe = '\n📊 **THỐNG KÊ DỰ ĐOÁN**\n| Phiên | KQ thực | Dự đoán | Đánh giá |\n|-------|---------|---------|----------|\n';
     const completed = predictions.filter(p => p.correct !== null).slice(0, 30);
     for (const p of completed.reverse()) {
         const actual = p.actual === 'TAI' ? 'Tài' : 'Xỉu';
@@ -401,15 +372,11 @@ app.get('/predict_text', async (req, res) => {
     const totalCompleted = predictions.filter(p => p.correct !== null).length;
     const correctCount = predictions.filter(p => p.correct === true).length;
     const accuracy = totalCompleted > 0 ? (correctCount / totalCompleted * 100).toFixed(1) : '0';
-    thongKe += `\n📈 Tổng số phiên đã đánh giá: ${totalCompleted}\n`;
-    thongKe += `✅ Đúng: ${correctCount}   ❌ Sai: ${totalCompleted - correctCount}\n`;
-    thongKe += `🎯 Tỷ lệ chính xác: ${accuracy}%\n`;
+    thongKe += `\n📈 Tổng số phiên đã đánh giá: ${totalCompleted}\n✅ Đúng: ${correctCount}   ❌ Sai: ${totalCompleted - correctCount}\n🎯 Tỷ lệ chính xác: ${accuracy}%\n`;
     
     let chot = lastPrediction ? (lastPrediction.predicted === 'TAI' ? 'Tài' : 'Xỉu') : 'Chưa có';
     let doTinCay = lastPrediction ? lastPrediction.confidence : 0;
-    
-    let statusNote = '';
-    if (usingMock) statusNote = '\n⚠️ *Đang dùng dữ liệu mô phỏng (mock) do API gốc không trả về dữ liệu.*\n';
+    let statusNote = usingMock ? '\n⚠️ *Đang dùng dữ liệu mô phỏng (mock) do API gốc không trả về dữ liệu hợp lệ.*\n' : '';
     
     const resultText = `🔮 **DỰ ĐOÁN PHIÊN TIẾP THEO** 🔮
 ━━━━━━━━━━━━━━━━━━━━
@@ -428,31 +395,28 @@ ${thongKe}
 ━━━━━━━━━━━━━━━━━━━━
 ⏱ Cập nhật: ${new Date().toLocaleString('vi-VN')}
 🔄 Tự động làm mới mỗi 30 giây
-📱 API: /predict_text (text)  |  /predict (JSON)`;
+📱 API: /predict_text  |  /predict  |  /fetch (POST)`;
     
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     res.send(resultText);
 });
 
 // Endpoint JSON
-app.get('/predict', async (req, res) => {
-    if (sessions.length === 0) sessions = generateMockSessions();
+app.get('/predict', (req, res) => {
+    if (sessions.length === 0) return res.json({ error: 'No data' });
     const latest = sessions[0];
     const nextId = latest.id_num + 1;
     const lastPrediction = predictions.find(p => p.predictedId === nextId);
-    
     const completed = predictions.filter(p => p.correct !== null);
     const correctCount = completed.filter(p => p.correct === true).length;
     const totalCompleted = completed.length;
     const accuracy = totalCompleted > 0 ? (correctCount / totalCompleted * 100).toFixed(1) : '0';
-    
     const recentPredictions = predictions.slice(0, 30).map(p => ({
         phiên: p.predictedId,
         kq_thuc: p.actual ? (p.actual === 'TAI' ? 'Tài' : 'Xỉu') : null,
         du_doan: p.predicted === 'TAI' ? 'Tài' : 'Xỉu',
         danh_gia: p.correct === null ? 'Chờ' : (p.correct ? 'Đúng' : 'Sai')
     }));
-    
     res.json({
         status: 'success',
         using_mock: usingMock,
@@ -479,27 +443,42 @@ app.get('/predict', async (req, res) => {
     });
 });
 
-app.get('/health', (req, res) => {
-    res.json({
-        status: 'ok',
-        sessions: sessions.length,
-        predictions: predictions.length,
-        using_mock: usingMock,
-        last_error: lastFetchError
-    });
+// Endpoint để người dùng tự gửi dữ liệu thật (nếu biết cấu trúc)
+app.post('/fetch', (req, res) => {
+    const { data } = req.body;
+    if (!data) return res.status(400).json({ error: 'Missing data field' });
+    const parsed = tryParseSessions(data);
+    if (parsed.length === 0) return res.status(400).json({ error: 'Cannot parse sessions from provided data' });
+    // Merge
+    const existingIds = new Set(sessions.map(s => s.id));
+    for (const ns of parsed) {
+        if (!existingIds.has(ns.id)) {
+            sessions.unshift(ns);
+            existingIds.add(ns.id);
+        }
+    }
+    sessions.sort((a,b) => b.id_num - a.id_num);
+    if (sessions.length > MAX_HISTORY) sessions = sessions.slice(0, MAX_HISTORY);
+    usingMock = false;
+    updatePredictions();
+    saveCache();
+    res.json({ status: 'ok', added: parsed.length, total: sessions.length });
 });
 
-// Force fetch ngay khi có request (tuỳ chọn, có thể bỏ)
+// Force fetch từ API gốc
 app.post('/force_fetch', async (req, res) => {
-    await fetchAndUpdate();
-    res.json({ status: 'fetched', using_mock: usingMock });
+    const ok = await fetchRealData();
+    res.json({ fetched: ok, using_mock: usingMock, error: lastFetchError });
+});
+
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', sessions: sessions.length, predictions: predictions.length, using_mock: usingMock, last_error: lastFetchError });
 });
 
 app.listen(PORT, () => {
-    console.log(`🚀 API dự đoán đã fix lỗi, chạy tại http://localhost:${PORT}`);
-    console.log(`📝 Xem báo cáo dạng text: http://localhost:${PORT}/predict_text`);
-    console.log(`📊 Xem JSON: http://localhost:${PORT}/predict`);
-    console.log(`🔍 Health check: http://localhost:${PORT}/health`);
-    console.log(`⚠️ Hiện tại đang dùng dữ liệu MOCK (giả lập) do API gốc không có dữ liệu.`);
-    console.log(`   Khi API gốc có dữ liệu, hệ thống sẽ tự động cập nhật và ghi đè mock.`);
+    console.log(`🚀 Server chạy tại http://localhost:${PORT}`);
+    console.log(`📝 Xem báo cáo text: http://localhost:${PORT}/predict_text`);
+    console.log(`📊 JSON: http://localhost:${PORT}/predict`);
+    console.log(`🔧 POST /fetch để gửi dữ liệu thủ công (JSON body: { "data": ... })`);
+    console.log(`🔄 POST /force_fetch để ép fetch từ API gốc`);
 });
