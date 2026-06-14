@@ -1,4 +1,3 @@
-// server.js - API dự đoán Tài Xỉu với phân tích MD5 + Cầu, xuất báo cáo theo mẫu
 const express = require('express');
 const axios = require('axios');
 
@@ -7,24 +6,39 @@ const PORT = process.env.PORT || 3000;
 
 // ========== CẤU HÌNH ==========
 const API_URL = 'https://treo-lc79-h6zy.onrender.com/';
-const MAX_HISTORY = 100000; // Lưu tối đa 100.000 phiên dự đoán
+const MAX_HISTORY = 100000;
+const FETCH_INTERVAL = 30000; // 30 giây
 
-// ========== LƯU TRỮ DỮ LIỆU ==========
-let sessions = [];           // Danh sách phiên từ API (id, result, dice, sum, md5)
-let predictions = [];        // Lịch sử dự đoán: { predictedId, predicted, confidence, method, actual, correct, timestamp }
+// ========== LƯU TRỮ ==========
+let sessions = [];      // [{ id, id_num, result, dice, diceSum, md5 }]
+let predictions = [];   // [{ predictedId, predicted, confidence, method, actual, correct, timestamp }]
+let lastFetchError = null;
+let isFetching = false;
 
-// ========== HÀM PARSE DỮ LIỆU TỪ API GỐC ==========
+// ========== HÀM PARSE (cải tiến, in log để debug) ==========
 function extractListFromResponse(data) {
     try {
+        // Nếu là string, thử parse JSON
         if (typeof data === 'string') {
-            const match = data.match(/\[.*?\]/s);
-            if (match) data = JSON.parse(match[0]);
+            // Thử tìm mảng JSON trong chuỗi
+            const jsonMatch = data.match(/\[\s*\{.*\}\s*\]/s);
+            if (jsonMatch) {
+                return JSON.parse(jsonMatch[0]);
+            }
+            // Thử parse toàn bộ
+            try {
+                const parsed = JSON.parse(data);
+                if (Array.isArray(parsed)) return parsed;
+                if (parsed?.data && Array.isArray(parsed.data)) return parsed.data;
+                if (parsed?.list && Array.isArray(parsed.list)) return parsed.list;
+            } catch(e) {}
         }
         if (Array.isArray(data)) return data;
         if (data?.data && Array.isArray(data.data)) return data.data;
         if (data?.list && Array.isArray(data.list)) return data.list;
         return [];
     } catch (e) {
+        console.error('extractListFromResponse error:', e.message);
         return [];
     }
 }
@@ -34,10 +48,12 @@ function normalizeSession(item) {
         let obj = typeof item === 'string' ? JSON.parse(item) : item;
         if (!obj) return null;
 
+        // Lấy id
         let id = obj.id || obj.session_id || obj.sessionId || '';
         let idNum = parseInt(id.toString().replace(/\D/g, ''));
         if (isNaN(idNum)) return null;
 
+        // Kết quả
         let result = (obj.result || '').toUpperCase();
         if (!result.includes('TAI') && !result.includes('XIU')) {
             if (obj.taiXiu) result = obj.taiXiu === 'TAI' ? 'TAI' : 'XIU';
@@ -46,6 +62,7 @@ function normalizeSession(item) {
         }
         result = result.includes('TAI') ? 'TAI' : 'XIU';
 
+        // Xúc xắc
         let dice = [];
         let diceSum = 0;
         if (obj.dice && Array.isArray(obj.dice)) dice = obj.dice.slice(0,3);
@@ -54,6 +71,8 @@ function normalizeSession(item) {
         if (dice.length === 3) {
             dice = dice.map(d => parseInt(d));
             diceSum = dice.reduce((a,b)=>a+b,0);
+        } else {
+            // Nếu không có dice, thử tính từ tổng? Bỏ qua
         }
 
         let md5 = obj.md5 || obj.hash || '';
@@ -67,12 +86,12 @@ function normalizeSession(item) {
             md5: md5.replace(/\s/g, '')
         };
     } catch (e) {
+        console.error('normalizeSession error:', e.message);
         return null;
     }
 }
 
 // ========== THUẬT TOÁN PHÂN TÍCH ==========
-// 1. Phân tích MD5
 function findSimilarMd5(currentMd5, history) {
     if (!currentMd5 || currentMd5.length < 10) return [];
     const similar = [];
@@ -106,7 +125,6 @@ function analyzeMd5(currentMd5, history) {
     return { prediction: pred, confidence: conf, samples: total };
 }
 
-// 2. Phân tích cầu (pattern)
 function analyzePattern(results) {
     if (results.length < 3) return { prediction: null, confidence: 0, reason: 'Chưa đủ dữ liệu' };
     const recent = results.slice(0, 12).map(r => r.result);
@@ -155,7 +173,6 @@ function analyzePattern(results) {
     return { prediction, confidence, reason, streak, pingpongLen, taiRate };
 }
 
-// 3. Kết hợp MD5 và cầu
 function combinePredictions(md5Pred, patternPred) {
     let finalPred = null;
     let finalConf = 0;
@@ -195,41 +212,69 @@ function combinePredictions(md5Pred, patternPred) {
     return { prediction: finalPred, confidence: finalConf, method };
 }
 
-// ========== CẬP NHẬT DỮ LIỆU & DỰ ĐOÁN ==========
+// ========== CẬP NHẬT DỮ LIỆU ==========
 async function fetchAndUpdate() {
+    if (isFetching) return false;
+    isFetching = true;
     try {
-        const resp = await axios.get(API_URL, { timeout: 15000 });
+        console.log(`[${new Date().toISOString()}] Fetching data from API...`);
+        const resp = await axios.get(API_URL, {
+            timeout: 20000,
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'application/json, text/plain, */*'
+            }
+        });
+        console.log(`Response status: ${resp.status}, content-type: ${resp.headers['content-type']}`);
+        
         const rawList = extractListFromResponse(resp.data);
-        if (!rawList.length) return false;
-
+        if (!rawList.length) {
+            console.warn('Extracted list is empty. Sample data:', typeof resp.data === 'string' ? resp.data.slice(0, 200) : resp.data);
+            lastFetchError = 'API trả về danh sách rỗng';
+            isFetching = false;
+            return false;
+        }
+        
         const newSessions = rawList.map(normalizeSession).filter(Boolean);
-        if (!newSessions.length) return false;
-
+        if (!newSessions.length) {
+            console.warn('No valid sessions after normalization');
+            lastFetchError = 'Không có phiên hợp lệ sau khi parse';
+            isFetching = false;
+            return false;
+        }
+        
+        // Sắp xếp mới nhất lên đầu
         newSessions.sort((a,b) => b.id_num - a.id_num);
         
-        // Thêm các phiên mới
+        // Hợp nhất với sessions cũ (giữ id duy nhất)
         const existingIds = new Set(sessions.map(s => s.id));
-        const added = [];
+        let addedCount = 0;
         for (const ns of newSessions) {
             if (!existingIds.has(ns.id)) {
                 sessions.unshift(ns);
-                added.push(ns);
+                addedCount++;
+                existingIds.add(ns.id);
             }
         }
         if (sessions.length > MAX_HISTORY) sessions = sessions.slice(0, MAX_HISTORY);
+        console.log(`Added ${addedCount} new sessions. Total: ${sessions.length}`);
         
         // Cập nhật kết quả thực cho các dự đoán trước
-        for (const sess of added) {
+        for (const sess of newSessions) {
             const existingPred = predictions.find(p => p.predictedId === sess.id_num);
             if (existingPred && existingPred.correct === null) {
                 existingPred.actual = sess.result;
                 existingPred.correct = (existingPred.predicted === sess.result);
                 existingPred.timestamp = Date.now();
+                console.log(`Updated prediction for session ${sess.id_num}: ${existingPred.correct ? 'Correct' : 'Wrong'}`);
             }
         }
         
         // Dự đoán cho phiên tiếp theo
-        if (sessions.length === 0) return false;
+        if (sessions.length === 0) {
+            isFetching = false;
+            return false;
+        }
         const latest = sessions[0];
         const nextIdNum = latest.id_num + 1;
         
@@ -238,7 +283,6 @@ async function fetchAndUpdate() {
         const patternAnalysis = analyzePattern(sessions);
         const combined = combinePredictions(md5Analysis, patternAnalysis);
         
-        // Chỉ lưu dự đoán nếu có kết quả
         if (combined.prediction) {
             predictions.unshift({
                 predictedId: nextIdNum,
@@ -250,48 +294,63 @@ async function fetchAndUpdate() {
                 timestamp: Date.now()
             });
             if (predictions.length > MAX_HISTORY) predictions = predictions.slice(0, MAX_HISTORY);
+            console.log(`New prediction for session #${nextIdNum}: ${combined.prediction} (${combined.confidence}%)`);
         }
+        
+        lastFetchError = null;
+        isFetching = false;
         return true;
     } catch (err) {
         console.error('Fetch error:', err.message);
+        lastFetchError = err.message;
+        isFetching = false;
         return false;
     }
 }
 
-// Tự động cập nhật mỗi 30 giây
-setInterval(() => fetchAndUpdate(), 30000);
-fetchAndUpdate(); // lần đầu
+// Khởi động fetch lần đầu và theo chu kỳ
+setInterval(() => fetchAndUpdate(), FETCH_INTERVAL);
+fetchAndUpdate(); // chạy ngay
 
 // ========== API ENDPOINTS ==========
 app.use(express.json());
 
-// Endpoint trả về text theo đúng mẫu yêu cầu
+// Endpoint trả về text theo mẫu yêu cầu
 app.get('/predict_text', async (req, res) => {
-    await fetchAndUpdate(); // cập nhật nhanh
+    // Đợi fetch lần đầu nếu chưa có dữ liệu
+    if (sessions.length === 0 && !lastFetchError) {
+        await fetchAndUpdate();
+    }
     if (sessions.length === 0) {
-        return res.send('❌ Chưa có dữ liệu từ API gốc');
+        let errorMsg = '❌ Chưa có dữ liệu từ API gốc.\n';
+        if (lastFetchError) errorMsg += `Lỗi gần nhất: ${lastFetchError}\n`;
+        errorMsg += `API URL: ${API_URL}\nHãy kiểm tra kết nối hoặc thử lại sau.`;
+        return res.status(503).send(errorMsg);
     }
     
     const latest = sessions[0];
     const nextId = latest.id_num + 1;
     const lastPrediction = predictions.find(p => p.predictedId === nextId);
     
-    // Tạo phần "Thuật toán dự đoán": liệt kê tất cả phiên và kết quả thực tế
+    // Tạo phần "Thuật toán dự đoán": lấy tất cả phiên (tối đa 100 phiên gần nhất để tránh quá dài)
     let thuatToan = '📜 **LỊCH SỬ CÁC PHIÊN (KẾT QUẢ THỰC TẾ)**\n';
     thuatToan += '| Phiên | Kết quả | Xúc xắc |\n';
     thuatToan += '|-------|---------|---------|\n';
-    for (let i = 0; i < Math.min(sessions.length, 50); i++) {
+    const maxDisplay = Math.min(sessions.length, 100);
+    for (let i = 0; i < maxDisplay; i++) {
         const s = sessions[i];
         const diceStr = s.dice.length ? s.dice.join('-') : '?';
         thuatToan += `| ${s.id_num} | ${s.result === 'TAI' ? 'Tài' : 'Xỉu'} | ${diceStr} |\n`;
     }
-    if (sessions.length > 50) thuatToan += `| ... và ${sessions.length - 50} phiên cũ hơn | ... | ... |\n`;
+    if (sessions.length > 100) {
+        thuatToan += `| ... và ${sessions.length - 100} phiên cũ hơn | ... | ... |\n`;
+    }
     
-    // Bảng thống kê dự đoán trước đó
+    // Thống kê dự đoán
     let thongKe = '\n📊 **THỐNG KÊ DỰ ĐOÁN**\n';
     thongKe += '| Phiên | KQ thực | Dự đoán | Đánh giá |\n';
     thongKe += '|-------|---------|---------|----------|\n';
-    const completed = predictions.filter(p => p.correct !== null).slice(0, 20);
+    const completed = predictions.filter(p => p.correct !== null).slice(0, 30);
     for (const p of completed.reverse()) {
         const actual = p.actual === 'TAI' ? 'Tài' : 'Xỉu';
         const pred = p.predicted === 'TAI' ? 'Tài' : 'Xỉu';
@@ -306,15 +365,8 @@ app.get('/predict_text', async (req, res) => {
     thongKe += `🎯 Tỷ lệ chính xác: ${accuracy}%\n`;
     
     // Kết luận dự đoán
-    let chot = '';
-    let doTinCay = 0;
-    if (lastPrediction) {
-        chot = lastPrediction.predicted === 'TAI' ? 'Tài' : 'Xỉu';
-        doTinCay = lastPrediction.confidence;
-    } else {
-        chot = 'Chưa đủ dữ liệu';
-        doTinCay = 0;
-    }
+    let chot = lastPrediction ? (lastPrediction.predicted === 'TAI' ? 'Tài' : 'Xỉu') : 'Chưa có';
+    let doTinCay = lastPrediction ? lastPrediction.confidence : 0;
     
     const resultText = `🔮 **DỰ ĐOÁN PHIÊN TIẾP THEO** 🔮
 ━━━━━━━━━━━━━━━━━━━━
@@ -339,11 +391,10 @@ ${thongKe}
     res.send(resultText);
 });
 
-// Endpoint JSON (đầy đủ thông tin)
+// Endpoint JSON
 app.get('/predict', async (req, res) => {
-    await fetchAndUpdate();
     if (sessions.length === 0) {
-        return res.json({ error: 'Chưa có dữ liệu từ API gốc' });
+        return res.status(503).json({ error: 'Chưa có dữ liệu từ API gốc', details: lastFetchError });
     }
     const latest = sessions[0];
     const nextId = latest.id_num + 1;
@@ -387,11 +438,17 @@ app.get('/predict', async (req, res) => {
 });
 
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok', sessions: sessions.length, predictions: predictions.length });
+    res.json({
+        status: sessions.length > 0 ? 'ok' : 'initializing',
+        sessions: sessions.length,
+        predictions: predictions.length,
+        lastError: lastFetchError
+    });
 });
 
 app.listen(PORT, () => {
     console.log(`🚀 API dự đoán chạy tại http://localhost:${PORT}`);
     console.log(`📝 Xem báo cáo dạng text: http://localhost:${PORT}/predict_text`);
     console.log(`📊 Xem JSON: http://localhost:${PORT}/predict`);
+    console.log(`🔍 Health check: http://localhost:${PORT}/health`);
 });
