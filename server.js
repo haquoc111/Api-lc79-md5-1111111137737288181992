@@ -194,10 +194,30 @@ function analyzePattern(results) {
     return { prediction, confidence, reason, streak, pingpongLen, taiRate };
 }
 
+function getFallbackPrediction() {
+    // Fallback: dựa vào thống kê tổng thể toàn bộ sessions
+    if (sessions.length === 0) return { prediction: 'TAI', confidence: 50, method: 'Mặc định (chưa có dữ liệu)' };
+    const taiCount = sessions.filter(s => s.result === 'TAI').length;
+    const xiuCount = sessions.length - taiCount;
+    const total = sessions.length;
+    const taiRate = taiCount / total;
+    if (Math.abs(taiRate - 0.5) < 0.03) {
+        // Quá cân bằng → xem xu hướng 20 phiên gần nhất
+        const recent20 = sessions.slice(0, 20);
+        const recentTai = recent20.filter(s => s.result === 'TAI').length;
+        const pred = recentTai >= 10 ? 'TAI' : 'XIU';
+        return { prediction: pred, confidence: 52, method: 'Thống kê gần (cân bằng tổng thể)' };
+    }
+    const pred = taiRate > 0.5 ? 'TAI' : 'XIU';
+    const conf = Math.min(Math.round(Math.max(taiRate, 1 - taiRate) * 100), 65);
+    return { prediction: pred, confidence: conf, method: 'Thống kê tổng thể' };
+}
+
 function combinePredictions(md5Pred, patternPred) {
     let finalPred = null;
     let finalConf = 0;
     let method = '';
+
     if (md5Pred.prediction && patternPred.prediction) {
         if (md5Pred.prediction === patternPred.prediction) {
             finalPred = md5Pred.prediction;
@@ -213,9 +233,8 @@ function combinePredictions(md5Pred, patternPred) {
                 finalConf = patternPred.confidence;
                 method = 'Cầu (ưu thế)';
             } else {
-                const taiCount = sessions.filter(s => s.result === 'TAI').length;
-                const xiuCount = sessions.length - taiCount;
-                finalPred = taiCount > xiuCount ? 'TAI' : 'XIU';
+                const fb = getFallbackPrediction();
+                finalPred = fb.prediction;
                 finalConf = 55;
                 method = 'Mâu thuẫn → chọn theo tổng thể';
             }
@@ -228,7 +247,14 @@ function combinePredictions(md5Pred, patternPred) {
         finalPred = patternPred.prediction;
         finalConf = patternPred.confidence;
         method = 'Chỉ cầu';
+    } else {
+        // Cả hai đều null → dùng fallback, KHÔNG để null
+        const fb = getFallbackPrediction();
+        finalPred = fb.prediction;
+        finalConf = fb.confidence;
+        method = fb.method;
     }
+
     return { prediction: finalPred, confidence: finalConf, method };
 }
 
@@ -240,29 +266,26 @@ function updatePredictions() {
     const md5Analysis = analyzeMd5(latest.md5, historyResults);
     const patternAnalysis = analyzePattern(sessions);
     const combined = combinePredictions(md5Analysis, patternAnalysis);
-    if (combined.prediction) {
-        const existing = predictions.find(p => p.predictedId === nextIdNum);
-        if (!existing) {
-            predictions.unshift({
-                predictedId: nextIdNum,
-                predicted: combined.prediction,
-                confidence: combined.confidence,
-                method: combined.method,
-                actual: null,
-                correct: null,
-                timestamp: Date.now()
-            });
-        } else if (existing.correct === null) {
-            existing.predicted = combined.prediction;
-            existing.confidence = combined.confidence;
-            existing.method = combined.method;
-        }
-        if (predictions.length > MAX_HISTORY) predictions = predictions.slice(0, MAX_HISTORY);
-        saveCache();
-        console.log(`Updated prediction for #${nextIdNum}: ${combined.prediction} (${combined.confidence}%)`);
-    } else {
-        console.log('No valid prediction generated.');
+    // combined.prediction luôn có giá trị (fallback đảm bảo)
+    const existing = predictions.find(p => p.predictedId === nextIdNum);
+    if (!existing) {
+        predictions.unshift({
+            predictedId: nextIdNum,
+            predicted: combined.prediction,
+            confidence: combined.confidence,
+            method: combined.method,
+            actual: null,
+            correct: null,
+            timestamp: Date.now()
+        });
+    } else if (existing.correct === null) {
+        existing.predicted = combined.prediction;
+        existing.confidence = combined.confidence;
+        existing.method = combined.method;
     }
+    if (predictions.length > MAX_HISTORY) predictions = predictions.slice(0, MAX_HISTORY);
+    saveCache();
+    console.log(`[Prediction] Phiên #${nextIdNum}: ${combined.prediction} (${combined.confidence}%) | ${combined.method}`);
 }
 
 // ========== FETCH DỮ LIỆU THẬT ==========
@@ -328,50 +351,73 @@ setTimeout(() => fetchRealData(), 1000);
 app.use(express.json({ limit: '5mb' }));
 
 app.get('/predict_text', (req, res) => {
-    if (sessions.length === 0) return res.send('No data');
+    if (sessions.length === 0) return res.send('Chưa có dữ liệu. Vui lòng thử lại sau.');
     const latest = sessions[0];
     const nextId = latest.id_num + 1;
     const lastPrediction = predictions.find(p => p.predictedId === nextId);
-    let thuatToan = '📜 **LỊCH SỬ CÁC PHIÊN (KẾT QUẢ THỰC TẾ)**\n| Phiên | Kết quả | Xúc xắc |\n|-------|---------|---------|\n';
-    const maxDisplay = Math.min(sessions.length, 100);
+
+    // ── Lịch sử phiên (tối đa 20 phiên gần nhất cho gọn) ──
+    const maxDisplay = Math.min(sessions.length, 20);
+    const colW = { id: 10, kq: 8, dice: 10, sum: 6 };
+    const hr = '─'.repeat(colW.id + colW.kq + colW.dice + colW.sum + 11);
+    const pad = (s, w) => String(s).padEnd(w);
+
+    let histLines = `\n📜 LỊCH SỬ ${maxDisplay} PHIÊN GẦN NHẤT\n`;
+    histLines += `${hr}\n`;
+    histLines += `${pad('Phiên', colW.id)} ${pad('K.Quả', colW.kq)} ${pad('Xúc xắc', colW.dice)} ${pad('Tổng', colW.sum)}\n`;
+    histLines += `${hr}\n`;
     for (let i = 0; i < maxDisplay; i++) {
         const s = sessions[i];
-        const diceStr = s.dice.join('-');
-        thuatToan += `| ${s.id_num} | ${s.result === 'TAI' ? 'Tài' : 'Xỉu'} | ${diceStr} |\n`;
+        const kq = s.result === 'TAI' ? '🔴 Tài' : '⚪ Xỉu';
+        histLines += `${pad('#' + s.id_num, colW.id)} ${pad(kq, colW.kq + 2)} ${pad(s.dice.join('-'), colW.dice)} ${s.diceSum}\n`;
     }
-    if (sessions.length > 100) thuatToan += `| ... và ${sessions.length-100} phiên cũ | ... | ... |\n`;
-    let thongKe = '\n📊 **THỐNG KÊ DỰ ĐOÁN**\n| Phiên | KQ thực | Dự đoán | Đánh giá |\n|-------|---------|---------|----------|\n';
-    const completed = predictions.filter(p => p.correct !== null).slice(0,30);
-    for (const p of completed.reverse()) {
-        const actual = p.actual === 'TAI' ? 'Tài' : 'Xỉu';
-        const pred = p.predicted === 'TAI' ? 'Tài' : 'Xỉu';
-        const danhGia = p.correct ? '✅ Đúng' : '❌ Sai';
-        thongKe += `| ${p.predictedId} | ${actual} | ${pred} | ${danhGia} |\n`;
+    if (sessions.length > maxDisplay) {
+        histLines += `... và ${sessions.length - maxDisplay} phiên cũ hơn\n`;
     }
-    const totalCompleted = predictions.filter(p => p.correct !== null).length;
-    const correctCount = predictions.filter(p => p.correct === true).length;
-    const accuracy = totalCompleted > 0 ? (correctCount / totalCompleted * 100).toFixed(1) : '0';
-    thongKe += `\n📈 Tổng: ${totalCompleted} | ✅ Đúng: ${correctCount} | ❌ Sai: ${totalCompleted-correctCount} | 🎯 Tỷ lệ: ${accuracy}%\n`;
-    let chot = lastPrediction ? (lastPrediction.predicted === 'TAI' ? 'Tài' : 'Xỉu') : 'Chưa có';
-    let doTinCay = lastPrediction ? lastPrediction.confidence : 0;
-    let statusNote = usingMock ? '\n⚠️ *Đang dùng dữ liệu mô phỏng (mock)*\n' : '';
-    const resultText = `🔮 **DỰ ĐOÁN PHIÊN TIẾP THEO** 🔮
-━━━━━━━━━━━━━━━━━━━━
-📌 **Phiên hiện tại:** #${latest.id_num}
-🎲 Xúc xắc: ${latest.dice.join('-')} (Tổng ${latest.diceSum})
-🏆 Kết quả: ${latest.result === 'TAI' ? 'Tài 🔴' : 'Xỉu ⚪'}
-${statusNote}
-${thuatToan}
-━━━━━━━━━━━━━━━━━━━━
-✨ **CHỐT DỰ ĐOÁN PHIÊN #${nextId}:**  
-👉 **${chot}**  
-🔒 Độ tin cậy: **${doTinCay}%**  
-🧠 Phương pháp: ${lastPrediction ? lastPrediction.method : 'Chưa có'}
 
-${thongKe}
-━━━━━━━━━━━━━━━━━━━━
-⏱ ${new Date().toLocaleString('vi-VN')}
-🔄 Tự động cập nhật mỗi 30 giây`;
+    // ── Thống kê dự đoán ──
+    const completed = predictions.filter(p => p.correct !== null);
+    const correctCount = completed.filter(p => p.correct === true).length;
+    const totalCompleted = completed.length;
+    const accuracy = totalCompleted > 0 ? (correctCount / totalCompleted * 100).toFixed(1) : '—';
+
+    let statsLines = `\n📊 THỐNG KÊ DỰ ĐOÁN GẦN ĐÂY\n`;
+    statsLines += `${hr}\n`;
+    statsLines += `${pad('Phiên', colW.id)} ${pad('Thực tế', colW.kq + 2)} ${pad('Dự đoán', colW.kq + 2)} Đánh giá\n`;
+    statsLines += `${hr}\n`;
+    const recentCompleted = completed.slice(0, 15).reverse();
+    for (const p of recentCompleted) {
+        const actual = p.actual === 'TAI' ? '🔴 Tài' : '⚪ Xỉu';
+        const pred   = p.predicted === 'TAI' ? '🔴 Tài' : '⚪ Xỉu';
+        const mark   = p.correct ? '✅' : '❌';
+        statsLines += `${pad('#' + p.predictedId, colW.id)} ${pad(actual, colW.kq + 4)} ${pad(pred, colW.kq + 4)} ${mark}\n`;
+    }
+    statsLines += `${hr}\n`;
+    statsLines += `Tổng đã đánh giá: ${totalCompleted}  ✅ ${correctCount}  ❌ ${totalCompleted - correctCount}  🎯 ${accuracy}%\n`;
+
+    // ── Chốt dự đoán ──
+    const chot      = lastPrediction ? (lastPrediction.predicted === 'TAI' ? '🔴 TÀI' : '⚪ XỈU') : '❓ Chưa có';
+    const doTinCay  = lastPrediction ? lastPrediction.confidence : 0;
+    const phuongPhap = lastPrediction ? lastPrediction.method : 'Chưa xác định';
+    const statusNote = usingMock ? '\n⚠️  Đang dùng dữ liệu mô phỏng (mock) — chưa kết nối API thật\n' : '';
+
+    const sep = '━'.repeat(36);
+    const resultText =
+`${sep}
+🔮  DỰ ĐOÁN TÀI XỈU — AI PHÂN TÍCH
+${sep}
+📌  Phiên hiện tại : #${latest.id_num}
+🎲  Xúc xắc       : ${latest.dice.join(' - ')}  (Tổng: ${latest.diceSum})
+🏆  Kết quả        : ${latest.result === 'TAI' ? '🔴 Tài' : '⚪ Xỉu'}
+${statusNote}${sep}
+✨  CHỐT PHIÊN #${nextId}
+👉  ${chot}
+🔒  Độ tin cậy    : ${doTinCay}%
+🧠  Phương pháp   : ${phuongPhap}
+${sep}${histLines}${statsLines}${sep}
+⏱  ${new Date().toLocaleString('vi-VN')}   🔄 Cập nhật mỗi 30 giây
+${sep}`;
+
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     res.send(resultText);
 });
@@ -403,9 +449,9 @@ app.get('/predict', (req, res) => {
         },
         du_doan_phien_tiep: {
             phien: nextId,
-            chot: lastPrediction ? (lastPrediction.predicted === 'TAI' ? 'Tài' : 'Xỉu') : null,
+            chot: lastPrediction ? (lastPrediction.predicted === 'TAI' ? 'Tài' : 'Xỉu') : 'Chưa có',
             do_tin_cay: lastPrediction ? lastPrediction.confidence : 0,
-            phuong_phap: lastPrediction ? lastPrediction.method : null
+            phuong_phap: lastPrediction ? lastPrediction.method : 'Chưa xác định'
         },
         thong_ke_du_doan: {
             tong_phiên_da_danh_gia: totalCompleted,
@@ -444,8 +490,14 @@ app.get('/health', (req, res) => {
 });
 
 app.listen(PORT, () => {
-    console.log(`🚀 Server running on port ${PORT}`);
-    console.log(`📝 Text report: http://localhost:${PORT}/predict_text`);
-    console.log(`📊 JSON: http://localhost:${PORT}/predict`);
-    console.log(`🔧 POST /fetch to submit real data manually`);
+    const sep = '─'.repeat(45);
+    console.log(`\n${sep}`);
+    console.log(`🚀  Server khởi động tại cổng ${PORT}`);
+    console.log(`${sep}`);
+    console.log(`📝  Báo cáo dạng text : http://localhost:${PORT}/predict_text`);
+    console.log(`📊  Kết quả JSON      : http://localhost:${PORT}/predict`);
+    console.log(`❤️   Kiểm tra sức khỏe : http://localhost:${PORT}/health`);
+    console.log(`🔧  POST /fetch       : Gửi dữ liệu thủ công`);
+    console.log(`🔄  POST /force_fetch : Ép fetch từ API ngay lập tức`);
+    console.log(`${sep}\n`);
 });
